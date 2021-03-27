@@ -106,6 +106,20 @@ public class FabricMod implements Mod {
 			parentId = Optional.empty();
 			parentData = null;
 		}
+
+		// update data for fabric loader
+		if(this.getId().equals("fabricloader")) {
+			updateData = new ModUpdateData(
+					ModUpdateProvider.fromKey("loader").get(),
+					Optional.empty(),
+					Optional.empty(),
+					Optional.empty(),
+					Optional.empty(),
+					Optional.empty(),
+					Optional.empty()
+			);
+		}
+
 		this.modMenuData = new ModMenuData(
 				badgeNames,
 				parentId,
