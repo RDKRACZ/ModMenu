@@ -3,6 +3,11 @@ package com.terraformersmc.modmenu.util.mod.fabric;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import com.terraformersmc.modmenu.ModMenu;
+import com.terraformersmc.modmenu.config.ModMenuConfig;
+import com.terraformersmc.modmenu.updates.AvailableUpdate;
+import com.terraformersmc.modmenu.updates.ModUpdateProvider;
+import com.terraformersmc.modmenu.updates.providers.LoaderMetaUpdateProvider;
+import com.terraformersmc.modmenu.updates.providers.ModrinthUpdateProvider;
 import com.terraformersmc.modmenu.util.OptionalUtil;
 import com.terraformersmc.modmenu.util.mod.Mod;
 import com.terraformersmc.modmenu.util.mod.ModIconHandler;
@@ -13,6 +18,7 @@ import net.fabricmc.loader.api.metadata.ModEnvironment;
 import net.fabricmc.loader.api.metadata.ModMetadata;
 import net.fabricmc.loader.api.metadata.Person;
 import net.minecraft.client.texture.NativeImageBackedTexture;
+import org.apache.commons.io.FilenameUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jetbrains.annotations.NotNull;
@@ -33,19 +39,29 @@ public class FabricMod implements Mod {
 
 	private final Map<String, String> links = new HashMap<>();
 
+	private AvailableUpdate availableUpdate = null;
+
 	public FabricMod(ModContainer modContainer) {
 		this.container = modContainer;
 		this.metadata = modContainer.getMetadata();
+
+		String modFileName = this.container instanceof net.fabricmc.loader.ModContainer ?
+			FilenameUtils.getBaseName(((net.fabricmc.loader.ModContainer) this.container).getOriginUrl().toString()) :
+			null;
 
 		/* Load modern mod menu custom value data */
 		boolean usesModernParent = false;
 		Optional<String> parentId = Optional.empty();
 		ModMenuData.DummyParentData parentData = null;
+		ModUpdateProvider<ModUpdateData> updateProvider = null;
+		ModUpdateData updateData = null;
 		Set<String> badgeNames = new HashSet<>();
 		CustomValue modMenuValue = metadata.getCustomValue("modmenu");
 		if (modMenuValue != null && modMenuValue.getType() == CustomValue.CvType.OBJECT) {
 			CustomValue.CvObject modMenuObject = modMenuValue.getAsObject();
 			CustomValue parentCv = modMenuObject.get("parent");
+			CustomValue updatesCv = modMenuObject.get("updates");
+			CustomValue modUpdaterCv = modMenuObject.get("modupdater");
 			if (parentCv != null) {
 				if (parentCv.getType() == CustomValue.CvType.STRING) {
 					parentId = Optional.of(parentCv.getAsString());
@@ -65,6 +81,37 @@ public class FabricMod implements Mod {
 					}
 				}
 			}
+			if (updatesCv != null) {
+				if (updatesCv.getType() == CustomValue.CvType.OBJECT) {
+					try {
+						CustomValue.CvObject updatesObj = updatesCv.getAsObject();
+						String providerKey = CustomValueUtil.getString("provider", updatesObj)
+								.orElseThrow(() -> new RuntimeException("Updates object lacks provider"));
+						updateProvider = ModUpdateProvider.fromKey(providerKey)
+								.orElseThrow(() -> new RuntimeException("Update provider not found."));
+						updateData = updateProvider.readModUpdateData(metadata, modFileName, updatesObj);
+					} catch (Throwable t) {
+						LOGGER.error("Error loading updates data from mod: " + metadata.getId(), t);
+					}
+				}
+			}
+			if (modUpdaterCv != null
+					&& modUpdaterCv.getType() == CustomValue.CvType.OBJECT
+					&& updateData == null) { // Only use as a fallback.
+				try {
+					CustomValue.CvObject updatesObj = modUpdaterCv.getAsObject();
+					String providerKey = CustomValueUtil.getString("strategy", updatesObj)
+							.orElseThrow(() -> new RuntimeException("Modupdater block lacks strategy key"));
+					if (!providerKey.equalsIgnoreCase("json")) {
+						updateProvider = ModUpdateProvider.fromKey(providerKey)
+								.orElseThrow(() -> new RuntimeException("Update provider not found."));
+
+						updateData = updateProvider.readModUpdateData(metadata, modFileName, updatesObj);
+					}
+				} catch (Throwable t) {
+					// As this is just for compatibility with other mods who use ModUpdater, it'll just silently fail.
+				}
+			}
 			badgeNames.addAll(CustomValueUtil.getStringSet("badges", modMenuObject).orElse(new HashSet<>()));
 			links.putAll(CustomValueUtil.getStringMap("links", modMenuObject).orElse(new HashMap<>()));
 			usesModernParent = modMenuObject.containsKey("parent");
@@ -74,10 +121,22 @@ public class FabricMod implements Mod {
 			parentId = Optional.empty();
 			parentData = null;
 		}
+
+		// update data for fabric loader
+		if (this.getId().equals("fabricloader")) {
+			updateProvider = ModUpdateProvider.fromKey("loader").get();
+			updateData = new LoaderMetaUpdateProvider.LoaderMetaUpdateData(metadata, modFileName);
+		} else if (this.getId().equals("fabric")) {
+			// Hardcoded Fabric-API update data from modrinth.
+			updateProvider = ModUpdateProvider.fromKey("modrinth").get();
+			updateData = new ModrinthUpdateProvider.ModrinthUpdateData(metadata, modFileName, "P7dR8mSH", "release");
+		}
+
 		this.modMenuData = new ModMenuData(
 				badgeNames,
 				parentId,
-				parentData
+				parentData,
+				updateData
 		);
 
 		/* Load legacy mod menu custom value data */
@@ -142,6 +201,20 @@ public class FabricMod implements Mod {
 		}
 		if ("minecraft".equals(getId())) {
 			badges.add(Badge.MINECRAFT);
+		}
+
+		// check for updates
+		if (!ModMenuConfig.DISABLE_UPDATE_CHECKS.getValue() && updateProvider != null && modMenuData.updateData != null) {
+			updateProvider.check(
+					this.getId(),
+					modMenuData.updateData, this::hasUpdateCallback);
+		}
+	}
+
+	private void hasUpdateCallback(AvailableUpdate update) {
+		if (update != null) {
+			LOGGER.warn("An update is available for {}. ({} -> {})", this.getName(), this.getVersion(), update.version());
+			this.availableUpdate = update;
 		}
 	}
 
@@ -238,6 +311,11 @@ public class FabricMod implements Mod {
 	}
 
 	@Override
+	public @Nullable AvailableUpdate getAvailableUpdate() {
+		return availableUpdate;
+	}
+
+	@Override
 	public @Nullable String getWebsite() {
 		if ("minecraft".equals(getId())) {
 			return "https://www.minecraft.net/";
@@ -290,11 +368,14 @@ public class FabricMod implements Mod {
 		private Optional<String> parent;
 		private @Nullable
 		final DummyParentData dummyParentData;
+		private @Nullable
+		final ModUpdateData updateData;
 
-		public ModMenuData(Set<String> badges, Optional<String> parent, DummyParentData dummyParentData) {
+		public ModMenuData(Set<String> badges, Optional<String> parent, DummyParentData dummyParentData, ModUpdateData updateData) {
 			this.badges = Badge.convert(badges);
 			this.parent = parent;
 			this.dummyParentData = dummyParentData;
+			this.updateData = updateData;
 		}
 
 		public Set<Badge> getBadges() {
@@ -307,6 +388,10 @@ public class FabricMod implements Mod {
 
 		public @Nullable DummyParentData getDummyParentData() {
 			return dummyParentData;
+		}
+
+		public @Nullable ModUpdateData getUpdateData() {
+			return updateData;
 		}
 
 		public void addClientBadge(boolean add) {
